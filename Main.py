@@ -1,8 +1,10 @@
+import base64
 import html
 import io
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -16,6 +18,7 @@ ADVANCED_CUTOFF = 4.0
 AGE_DIVISIONS = ["U18", "18-30", "Above 30"]
 LEVELS = ["Advanced", "Intermediate", "No DUPR Rating"]
 GENDERS = ["Boys / Men", "Girls / Women"]
+APP_DIRECTORY = Path(__file__).resolve().parent
 
 st.set_page_config(
     page_title="Pickleball Player Manager",
@@ -53,6 +56,15 @@ def apply_theme() -> None:
         .hero-kicker {font-size:.76rem; font-weight:800; letter-spacing:.15em; text-transform:uppercase; color:var(--lime); margin-bottom:.35rem;}
         .hero h1 {font-size:clamp(1.55rem, 4vw, 2.45rem); line-height:1.08; margin:0; color:white;}
         .hero p {font-size:clamp(.9rem, 2vw, 1.05rem); color:#dcefeb; margin:.55rem 0 0;}
+        .hero h1, .hero p {padding-right:185px; position:relative; z-index:1;}
+        .hero-kicker {position:relative; z-index:1;}
+        .hero-logo-shell {
+            position:absolute; z-index:2; right:1.65rem; top:50%; transform:translateY(-50%);
+            width:150px; height:122px; padding:5px; border-radius:17px;
+            background:rgba(255,255,255,.94); border:1px solid rgba(255,255,255,.6);
+            box-shadow:0 10px 25px rgba(0,0,0,.2);
+        }
+        .hero-logo {width:100%; height:100%; display:block; object-fit:cover; border-radius:12px;}
         div[data-testid="stMetric"] {
             background: rgba(255,255,255,.94); border:1px solid var(--line); border-radius:16px;
             padding:1rem 1.05rem; box-shadow:0 5px 18px rgba(16,42,67,.055); min-height:108px;
@@ -84,6 +96,10 @@ def apply_theme() -> None:
             .block-container {padding:.75rem .75rem 2rem;}
             .hero {padding:1.15rem; border-radius:17px;}
             .hero:after {width:120px; height:120px; right:-50px; top:-60px;}
+            .hero h1 {padding-right:88px; font-size:1.48rem !important;}
+            .hero p {padding-right:0; margin-top:.9rem;}
+            .hero-logo-shell {right:.85rem; top:.85rem; transform:none; width:72px; height:65px; padding:3px; border-radius:11px;}
+            .hero-logo {border-radius:8px;}
             .rating-grid {grid-template-columns:1fr;}
             div[data-testid="stMetric"] {min-height:90px; padding:.75rem;}
             div[data-testid="stHorizontalBlock"] {flex-wrap:wrap !important; gap:.45rem !important;}
@@ -118,6 +134,17 @@ def get_dupr_token() -> str | None:
         token = None
     token = token or os.environ.get("DUPR_TOKEN")
     return str(token).strip() if token else None
+
+
+@st.cache_data(show_spinner=False)
+def get_asset_data_uri(relative_path: str) -> str:
+    """Return a small local image as an embeddable data URI."""
+    asset_path = APP_DIRECTORY / relative_path
+    if not asset_path.is_file():
+        return ""
+    mime_type = "image/jpeg" if asset_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+    encoded = base64.b64encode(asset_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def find_column(df: pd.DataFrame, possible_names: list[str]) -> str | None:
@@ -690,13 +717,21 @@ def render_export(results_df: pd.DataFrame | None) -> None:
 apply_theme()
 token = get_dupr_token()
 results_df = st.session_state.get("results")
+logo_uri = get_asset_data_uri("assets/tournament_logo.jpg")
+logo_markup = (
+    f'<div class="hero-logo-shell"><img class="hero-logo" src="{logo_uri}" '
+    'alt="Vadodara Pickleball League tournament logo"></div>'
+    if logo_uri
+    else ""
+)
 
 st.markdown(
-    """
+    f"""
     <div class="hero">
       <div class="hero-kicker">Tournament operations</div>
       <h1>🏓 Pickleball Player Manager</h1>
       <p>Registration · DUPR · Tournament Classification</p>
+      {logo_markup}
     </div>
     """,
     unsafe_allow_html=True,
