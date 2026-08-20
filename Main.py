@@ -16,9 +16,9 @@ from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
 
 
-DUPR_API = "https://api.dupr.gg/player/v1.0/search/public"
-DUPR_ID_API = "https://api.dupr.gg/player/search/byDuprId"
-DUPR_PLAYER_API = "https://api.dupr.gg/player/v1.0/{player_id}"
+DUPR_API = "https://api.dupr.gg/player/v1.0/search/public/"
+DUPR_ID_API = "https://api.dupr.gg/player/search/byDuprId/"
+DUPR_PLAYER_API = "https://api.dupr.gg/player/v1.0/{player_id}/"
 ADVANCED_CUTOFF = 4.0
 AGE_DIVISIONS = ["U18", "18-30", "Above 30"]
 LEVELS = ["Advanced", "Intermediate", "No DUPR Rating"]
@@ -307,15 +307,27 @@ def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
         "filter": {"lat": 0, "lng": 0, "radiusInMeters": 50000000},
         "includeUnclaimedPlayers": True,
     }
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "PickleballPlayerManager/1.0",
+        "Connection": "close",
+    }
     try:
+        request_stage = "public search"
         response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
         # DUPR occasionally returns a route-level 404 for public search. Retry
         # once, then use its exact-ID endpoint as a reliable fallback.
         if response.status_code == 404:
+            # Close the pooled connection before retrying so a cloud deployment
+            # is not pinned to the same unhealthy upstream route.
+            get_dupr_session().close()
+            get_dupr_session.clear()
             time.sleep(0.4)
             response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
         if response.status_code == 404:
+            request_stage = "exact-ID lookup"
             id_response = get_dupr_session().post(
                 DUPR_ID_API,
                 json={"duprId": dupr_id},
@@ -328,6 +340,7 @@ def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
                 player_id = matches[0].get("userId") if matches and isinstance(matches[0], dict) else None
                 if not player_id:
                     return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
+                request_stage = "player details"
                 response = get_dupr_session().get(
                     DUPR_PLAYER_API.format(player_id=player_id),
                     headers=headers,
@@ -346,7 +359,11 @@ def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
         if response.status_code == 403:
             return {"status": "FORBIDDEN", "player": None, "message": "DUPR denied access to this request."}
         if response.status_code != 200:
-            return {"status": "API_ERROR", "player": None, "message": f"DUPR returned HTTP {response.status_code}."}
+            return {
+                "status": "API_ERROR",
+                "player": None,
+                "message": f"DUPR {request_stage} returned HTTP {response.status_code}.",
+            }
         try:
             data = response.json()
         except ValueError:
