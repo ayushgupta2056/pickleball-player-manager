@@ -3,6 +3,7 @@ import html
 import io
 import os
 import re
+import ssl
 import time
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,13 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill
+from requests.adapters import HTTPAdapter
+from urllib3 import PoolManager
 
 
 DUPR_API = "https://api.dupr.gg/player/v1.0/search/public"
+DUPR_ID_API = "https://api.dupr.gg/player/search/byDuprId"
+DUPR_PLAYER_API = "https://api.dupr.gg/player/v1.0/{player_id}"
 ADVANCED_CUTOFF = 4.0
 AGE_DIVISIONS = ["U18", "18-30", "Above 30"]
 LEVELS = ["Advanced", "Intermediate", "No DUPR Rating"]
@@ -92,6 +97,7 @@ def apply_theme() -> None:
         .stButton > button, .stDownloadButton > button {min-height:2.8rem; border-radius:11px; font-weight:750;}
         div[data-testid="stFileUploader"] {background:white; border-radius:16px; padding:.35rem;}
         div[data-testid="stDataFrame"] {max-width:100%; overflow:hidden; border-radius:12px;}
+        .st-key-individual_dupr_id input {text-transform:uppercase;}
         @media (max-width: 700px) {
             .block-container {padding:.75rem .75rem 2rem;}
             .hero {padding:1.15rem; border-radius:17px;}
@@ -134,6 +140,44 @@ def get_dupr_token() -> str | None:
         token = None
     token = token or os.environ.get("DUPR_TOKEN")
     return str(token).strip() if token else None
+
+
+class WindowsTrustStoreAdapter(HTTPAdapter):
+    """Use Windows' trusted roots while preserving normal TLS verification."""
+
+    def init_poolmanager(
+        self,
+        connections: int,
+        maxsize: int,
+        block: bool = False,
+        **pool_kwargs: Any,
+    ) -> None:
+        context = ssl.create_default_context()
+        for store_name in ("ROOT", "CA"):
+            for certificate, encoding, _trust in ssl.enum_certificates(store_name):
+                if encoding != "x509_asn":
+                    continue
+                try:
+                    context.load_verify_locations(cadata=certificate)
+                except ssl.SSLError:
+                    # Ignore malformed/unsupported entries and retain all valid roots.
+                    continue
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            ssl_context=context,
+            **pool_kwargs,
+        )
+
+
+@st.cache_resource
+def get_dupr_session() -> requests.Session:
+    """Create a reusable HTTPS session that respects the host OS trust store."""
+    session = requests.Session()
+    if os.name == "nt" and hasattr(ssl, "enum_certificates"):
+        session.mount("https://api.dupr.gg/", WindowsTrustStoreAdapter())
+    return session
 
 
 @st.cache_data(show_spinner=False)
@@ -265,7 +309,38 @@ def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
     }
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        response = requests.post(DUPR_API, json=body, headers=headers, timeout=20)
+        response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
+        # DUPR occasionally returns a route-level 404 for public search. Retry
+        # once, then use its exact-ID endpoint as a reliable fallback.
+        if response.status_code == 404:
+            time.sleep(0.4)
+            response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
+        if response.status_code == 404:
+            id_response = get_dupr_session().post(
+                DUPR_ID_API,
+                json={"duprId": dupr_id},
+                headers=headers,
+                timeout=20,
+            )
+            if id_response.status_code == 200:
+                id_data = id_response.json()
+                matches = id_data.get("results", []) if isinstance(id_data, dict) else []
+                player_id = matches[0].get("userId") if matches and isinstance(matches[0], dict) else None
+                if not player_id:
+                    return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
+                response = get_dupr_session().get(
+                    DUPR_PLAYER_API.format(player_id=player_id),
+                    headers=headers,
+                    timeout=20,
+                )
+                if response.status_code == 200:
+                    detail_data = response.json()
+                    player = detail_data.get("result") if isinstance(detail_data, dict) else None
+                    if isinstance(player, dict) and clean_dupr_id(player.get("duprId", "")) == dupr_id:
+                        return {"status": "FOUND", "player": player, "message": "Player found."}
+                    return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR returned an unexpected response format."}
+            else:
+                response = id_response
         if response.status_code == 401:
             return {"status": "TOKEN_EXPIRED", "player": None, "message": "DUPR authentication expired or is invalid."}
         if response.status_code == 403:
@@ -285,6 +360,8 @@ def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
         return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
     except requests.exceptions.Timeout:
         return {"status": "TIMEOUT", "player": None, "message": "The DUPR request timed out."}
+    except requests.exceptions.SSLError:
+        return {"status": "TLS_ERROR", "player": None, "message": "A secure connection to DUPR could not be established."}
     except requests.exceptions.RequestException:
         return {"status": "NETWORK_ERROR", "player": None, "message": "Could not reach DUPR. Check the network and try again."}
     except Exception:
@@ -612,12 +689,27 @@ def render_bulk_upload(token: str | None) -> None:
     st.rerun()
 
 
+def uppercase_individual_dupr_id() -> None:
+    """Keep the visible lookup value in canonical DUPR uppercase form."""
+    value = st.session_state.get("individual_dupr_id", "")
+    st.session_state["individual_dupr_id"] = str(value).strip().upper()
+
+
 def render_individual_lookup(token: str | None) -> None:
     st.subheader("Individual DUPR lookup")
     st.caption("Find and classify one player without uploading a spreadsheet.")
-    with st.form("individual_lookup_form"):
-        dupr_id = st.text_input("Enter DUPR ID", placeholder="N5VJNN").strip().upper()
-        submitted = st.form_submit_button("Find Player", type="primary", use_container_width=True, disabled=not token)
+    dupr_id = st.text_input(
+        "Enter DUPR ID",
+        placeholder="N5VJNN",
+        key="individual_dupr_id",
+        on_change=uppercase_individual_dupr_id,
+    ).strip().upper()
+    submitted = st.button(
+        "Find Player",
+        type="primary",
+        use_container_width=True,
+        disabled=not token,
+    )
     if not token:
         st.error("Admin configuration required: DUPR_TOKEN is not set. Ask the app administrator to configure Streamlit Secrets.")
         return
