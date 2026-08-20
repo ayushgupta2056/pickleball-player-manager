@@ -14,11 +14,13 @@ import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
+from urllib3.util.retry import Retry
 
 
-DUPR_API = "https://api.dupr.gg/player/v1.0/search/public/"
-DUPR_ID_API = "https://api.dupr.gg/player/search/byDuprId/"
-DUPR_PLAYER_API = "https://api.dupr.gg/player/v1.0/{player_id}/"
+DUPR_BASE_URL = "https://api.dupr.gg"
+DUPR_SEARCH_PATH = "/player/v1.0/search/public"
+DUPR_ID_PATH = "/player/search/byDuprId"
+DUPR_PLAYER_PATH = "/player/v1.0/{player_id}"
 ADVANCED_CUTOFF = 4.0
 AGE_DIVISIONS = ["U18", "18-30", "Above 30"]
 LEVELS = ["Advanced", "Intermediate", "No DUPR Rating"]
@@ -139,7 +141,12 @@ def get_dupr_token() -> str | None:
     except (FileNotFoundError, KeyError, TypeError):
         token = None
     token = token or os.environ.get("DUPR_TOKEN")
-    return str(token).strip() if token else None
+    if not token:
+        return None
+    normalized = str(token).strip().strip('"').strip("'")
+    if normalized.lower().startswith("bearer "):
+        normalized = normalized[7:].strip()
+    return normalized or None
 
 
 class WindowsTrustStoreAdapter(HTTPAdapter):
@@ -171,12 +178,32 @@ class WindowsTrustStoreAdapter(HTTPAdapter):
         )
 
 
-@st.cache_resource
-def get_dupr_session() -> requests.Session:
-    """Create a reusable HTTPS session that respects the host OS trust store."""
+def build_dupr_session() -> requests.Session:
+    """Build a fresh, verified session for one DUPR lookup operation."""
+    retry_policy = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
+        backoff_factor=0.35,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
     session = requests.Session()
     if os.name == "nt" and hasattr(ssl, "enum_certificates"):
-        session.mount("https://api.dupr.gg/", WindowsTrustStoreAdapter())
+        adapter: HTTPAdapter = WindowsTrustStoreAdapter(max_retries=retry_policy)
+    else:
+        adapter = HTTPAdapter(max_retries=retry_policy)
+    session.mount("https://", adapter)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "PickleballPlayerManager/2.0",
+        }
+    )
     return session
 
 
@@ -293,96 +320,118 @@ def classify_level(rating: float | None) -> str:
     return "Advanced" if rating >= ADVANCED_CUTOFF else "Intermediate"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
-    """Search DUPR by ID using the established public-search request structure."""
-    dupr_id = clean_dupr_id(dupr_id)
-    if not dupr_id:
-        return {"status": "NO_ID", "player": None, "message": "No DUPR ID supplied."}
+def dupr_failure(response: requests.Response, stage: str) -> dict[str, Any]:
+    """Convert a non-successful DUPR response into a stable app result."""
+    if response.status_code == 401:
+        return {"status": "TOKEN_EXPIRED", "player": None, "message": "DUPR rejected the configured API key."}
+    if response.status_code == 403:
+        return {"status": "FORBIDDEN", "player": None, "message": "DUPR denied this API key access."}
+    return {
+        "status": "API_ERROR",
+        "player": None,
+        "message": f"DUPR {stage} failed with HTTP {response.status_code}.",
+    }
 
-    body = {
-        "offset": 0,
-        "limit": 10,
-        "query": dupr_id,
-        "filter": {"lat": 0, "lng": 0, "radiusInMeters": 50000000},
-        "includeUnclaimedPlayers": True,
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "PickleballPlayerManager/1.0",
-        "Connection": "close",
-    }
+
+def response_json(response: requests.Response) -> dict[str, Any] | None:
+    """Decode a DUPR JSON object, rejecting HTML and other unexpected bodies."""
     try:
-        request_stage = "public search"
-        response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
-        # DUPR occasionally returns a route-level 404 for public search. Retry
-        # once, then use its exact-ID endpoint as a reliable fallback.
-        if response.status_code == 404:
-            # Close the pooled connection before retrying so a cloud deployment
-            # is not pinned to the same unhealthy upstream route.
-            get_dupr_session().close()
-            get_dupr_session.clear()
-            time.sleep(0.4)
-            response = get_dupr_session().post(DUPR_API, json=body, headers=headers, timeout=20)
-        if response.status_code == 404:
-            request_stage = "exact-ID lookup"
-            id_response = get_dupr_session().post(
-                DUPR_ID_API,
-                json={"duprId": dupr_id},
-                headers=headers,
-                timeout=20,
+        data = response.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class DuprClient:
+    """Small client for the external read-only DUPR player endpoints."""
+
+    def __init__(self, token: str) -> None:
+        self.session = build_dupr_session()
+        self.session.headers["Authorization"] = f"Bearer {token}"
+
+    def close(self) -> None:
+        self.session.close()
+
+    def lookup(self, dupr_id: str) -> dict[str, Any]:
+        # First resolve the public DUPR code to DUPR's internal numeric player ID.
+        exact = self.session.post(
+            f"{DUPR_BASE_URL}{DUPR_ID_PATH}",
+            json={"duprId": dupr_id},
+            timeout=(8, 20),
+        )
+        if exact.status_code == 200:
+            exact_data = response_json(exact)
+            if exact_data is None:
+                return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR exact-ID lookup returned invalid data."}
+            matches = exact_data.get("results", [])
+            player_id = matches[0].get("userId") if isinstance(matches, list) and matches and isinstance(matches[0], dict) else None
+            if not player_id:
+                return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
+
+            details = self.session.get(
+                f"{DUPR_BASE_URL}{DUPR_PLAYER_PATH.format(player_id=player_id)}",
+                timeout=(8, 20),
             )
-            if id_response.status_code == 200:
-                id_data = id_response.json()
-                matches = id_data.get("results", []) if isinstance(id_data, dict) else []
-                player_id = matches[0].get("userId") if matches and isinstance(matches[0], dict) else None
-                if not player_id:
-                    return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
-                request_stage = "player details"
-                response = get_dupr_session().get(
-                    DUPR_PLAYER_API.format(player_id=player_id),
-                    headers=headers,
-                    timeout=20,
-                )
-                if response.status_code == 200:
-                    detail_data = response.json()
-                    player = detail_data.get("result") if isinstance(detail_data, dict) else None
-                    if isinstance(player, dict) and clean_dupr_id(player.get("duprId", "")) == dupr_id:
-                        return {"status": "FOUND", "player": player, "message": "Player found."}
-                    return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR returned an unexpected response format."}
-            else:
-                response = id_response
-        if response.status_code == 401:
-            return {"status": "TOKEN_EXPIRED", "player": None, "message": "DUPR authentication expired or is invalid."}
-        if response.status_code == 403:
-            return {"status": "FORBIDDEN", "player": None, "message": "DUPR denied access to this request."}
-        if response.status_code != 200:
-            return {
-                "status": "API_ERROR",
-                "player": None,
-                "message": f"DUPR {request_stage} returned HTTP {response.status_code}.",
-            }
-        try:
-            data = response.json()
-        except ValueError:
-            return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR returned an unreadable response."}
-        hits = data.get("result", {}).get("hits", []) if isinstance(data, dict) else []
+            if details.status_code == 200:
+                details_data = response_json(details)
+                player = details_data.get("result") if details_data else None
+                if isinstance(player, dict) and clean_dupr_id(player.get("duprId", "")) == dupr_id:
+                    return {"status": "FOUND", "player": player, "message": "Player found."}
+                return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR player details did not match the requested ID."}
+            if details.status_code not in (404, 405):
+                return dupr_failure(details, "player-details request")
+        elif exact.status_code not in (404, 405):
+            return dupr_failure(exact, "exact-ID request")
+
+        # Some DUPR deployments do not expose the exact-ID route. Public search
+        # is the compatibility fallback and also contains full rating details.
+        search = self.session.post(
+            f"{DUPR_BASE_URL}{DUPR_SEARCH_PATH}",
+            json={
+                "offset": 0,
+                "limit": 10,
+                "query": dupr_id,
+                "filter": {"lat": 0, "lng": 0, "radiusInMeters": 50000000},
+                "includeUnclaimedPlayers": True,
+            },
+            timeout=(8, 20),
+        )
+        if search.status_code != 200:
+            return dupr_failure(search, "public-search request")
+        search_data = response_json(search)
+        result = search_data.get("result") if search_data else None
+        hits = result.get("hits", []) if isinstance(result, dict) else []
         if not isinstance(hits, list):
-            return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR returned an unexpected response format."}
+            return {"status": "BAD_RESPONSE", "player": None, "message": "DUPR public search returned invalid data."}
         for player in hits:
             if isinstance(player, dict) and clean_dupr_id(player.get("duprId", "")) == dupr_id:
                 return {"status": "FOUND", "player": player, "message": "Player found."}
         return {"status": "NOT_FOUND", "player": None, "message": "No player matched that DUPR ID."}
+
+
+def get_dupr_player(dupr_id: str, token: str) -> dict[str, Any]:
+    """Look up one DUPR player without caching failures between requests."""
+    normalized_id = clean_dupr_id(dupr_id)
+    if not normalized_id:
+        return {"status": "NO_ID", "player": None, "message": "No DUPR ID supplied."}
+
+    client = DuprClient(token)
+    try:
+        return client.lookup(normalized_id)
     except requests.exceptions.Timeout:
         return {"status": "TIMEOUT", "player": None, "message": "The DUPR request timed out."}
     except requests.exceptions.SSLError:
         return {"status": "TLS_ERROR", "player": None, "message": "A secure connection to DUPR could not be established."}
-    except requests.exceptions.RequestException:
-        return {"status": "NETWORK_ERROR", "player": None, "message": "Could not reach DUPR. Check the network and try again."}
+    except requests.exceptions.RequestException as exc:
+        return {
+            "status": "NETWORK_ERROR",
+            "player": None,
+            "message": f"DUPR could not be reached ({type(exc).__name__}).",
+        }
     except Exception:
         return {"status": "API_ERROR", "player": None, "message": "An unexpected DUPR lookup error occurred."}
+    finally:
+        client.close()
 
 
 def player_full_name(player: dict[str, Any] | None) -> str | None:
